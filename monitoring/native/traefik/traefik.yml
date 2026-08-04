@@ -1,0 +1,31 @@
+# Traefik static config — native Windows (no Docker provider).
+# Entrypoints: 80 (HTTP -> HTTPS redirect), 443 (HTTPS), 8090 (dashboard).
+api:
+  dashboard: true
+  insecure: false
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
+  dashboard:
+    address: ":8090"
+
+providers:
+  file:
+    filename: D:/h/gemini-vision-studio/monitoring/native/traefik/dynamic.yml
+    watch: true
+
+log:
+  level: INFO
+  filePath: D:/h/gemini-vision-studio/backend/logs/traefik.log
+
+accessLog:
+  filePath: D:/h/gemini-vision-studio/backend/logs/traefik-access.log

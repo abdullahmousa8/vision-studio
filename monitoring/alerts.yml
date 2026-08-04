@@ -1,0 +1,60 @@
+groups:
+  - name: studio_alerts
+    rules:
+      - alert: StudioAPIDown
+        expr: up{job="gemini-vision-studio"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gemini Vision Studio API is unreachable"
+          description: "Prometheus cannot scrape {{ $labels.instance }} for 2 minutes."
+
+      - alert: HighJobFailureRate
+        expr: |
+          rate(jobs_completed_total{status="failed"}[15m])
+          / clamp_min(rate(jobs_completed_total[15m]), 0.001) > 0.5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than half of jobs are failing"
+          description: "Job failure rate is {{ $value | humanizePercentage }} over the last 15 minutes."
+
+      - alert: HighLLMErrorRate
+        expr: rate(api_calls_total{status="error"}[15m]) > 0.3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated LLM error rate"
+          description: "{{ $value | humanize }} LLM calls/sec failing over the last 15 minutes."
+
+      - alert: HighHTTP5xxRate
+        expr: |
+          rate(http_requests_total{status=~"5.."}[10m])
+          / clamp_min(rate(http_requests_total[10m]), 0.001) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated HTTP 5xx rate"
+          description: "{{ $value | humanizePercentage }} of HTTP responses are 5xx."
+
+      - alert: QueueBacklog
+        expr: celery_queue_depth > 15
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Celery queue is backing up"
+          description: "Queue depth is {{ $value }} for 5 minutes; workers may be stuck."
+
+      - alert: LowVRAMHeadroom
+        expr: ollama_vram_usage_mb > 4000
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "Ollama VRAM usage is high"
+          description: "VRAM usage is {{ $value }} MB; model loading may fail."

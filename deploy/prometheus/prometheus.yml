@@ -1,0 +1,30 @@
+# Production Prometheus scrape config.
+# Targets use service names from docker-compose.prod.yml (same Docker network).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: "production"
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  # FastAPI app: /metrics aggregates API + worker + beat (shared multiprocess dir)
+  - job_name: "gemini-vision-studio"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+        labels:
+          service: "api"
+
+  - job_name: "minio"
+    metrics_path: /minio/v2/metrics/cluster
+    static_configs:
+      - targets: ["minio:9000"]
+        labels:
+          service: "minio"
+
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

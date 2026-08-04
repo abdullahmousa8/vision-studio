@@ -1,0 +1,29 @@
+# Native Windows Prometheus config (no Docker).
+# Scrapes the app at localhost:8000 and MinIO at localhost:9000.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: "native"
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: "gemini-vision-studio"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["localhost:8000"]
+        labels:
+          service: "api"
+
+  - job_name: "minio"
+    metrics_path: /minio/v2/metrics/cluster
+    static_configs:
+      - targets: ["localhost:9000"]
+        labels:
+          service: "minio"
+
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

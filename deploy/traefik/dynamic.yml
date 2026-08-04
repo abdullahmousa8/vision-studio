@@ -1,0 +1,23 @@
+# Traefik dynamic configuration.
+# Routers for the frontend and API are defined via Docker labels on the
+# frontend/api services in docker-compose.prod.yml. This file holds the
+# cross-cutting middleware and TLS/security headers applied to them.
+
+http:
+  middlewares:
+    security-headers:
+      headers:
+        frameDeny: true
+        sslRedirect: true
+        browserXssFilter: true
+        contentTypeNosniff: true
+        forceSTSHeader: true
+        stsIncludeSubdomains: true
+        stsPreload: true
+        stsSeconds: 31536000
+        customFrameOptionsValue: "SAMEORIGIN"
+
+    rate-limit:
+      rateLimit:
+        average: 60
+        burst: 20

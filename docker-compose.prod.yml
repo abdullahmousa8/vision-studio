@@ -1,0 +1,287 @@
+# Production launch stack for Gemini Vision Studio.
+#
+# Usage:
+#   1. cp deploy/.env.production.example .env        (then fill in real values)
+#   2. bash deploy/init-secrets.sh                   (or write ./secrets/*.txt manually)
+#   3. docker compose -f docker-compose.prod.yml up -d --build
+#
+# Notes:
+#   - Let's Encrypt certificates are issued automatically via Traefik once DNS
+#     for APP_DOMAIN / API_DOMAIN points at this server (HTTP-01 challenge).
+#   - For a Linux host, set OLLAMA_BASE_URL to the server IP running Ollama,
+#     e.g. http://192.168.1.10:11434  (host.docker.internal is Docker Desktop only).
+#   - A GPU server can instead run Ollama in Docker: add --profile llm.
+name: gemini-vision-studio
+
+# --------------------------------------------------------------------------
+# Shared backend environment (API + worker + beat + migrate).
+# Secret values are intentionally NOT here: they come from Docker secrets
+# mounted at /run/secrets (config.py prefers those over env vars).
+# --------------------------------------------------------------------------
+x-backend-env: &backend-env
+  APP_ENV: production
+  DEBUG: "false"
+  API_V1_PREFIX: /api/v1
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-gemini_vision}
+  SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-gemini_vision}
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/0
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+  MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+  MINIO_BUCKET: artifacts
+  MINIO_SECURE: "false"
+  OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+  OPENROUTER_URL: https://openrouter.ai/api/v1
+  APP_URL: ${APP_URL:-https://${APP_DOMAIN}}
+  CORS_ORIGINS: ${CORS_ORIGINS:-https://${APP_DOMAIN}}
+  DAILY_BUDGET_USD: ${DAILY_BUDGET_USD:-5.0}
+  ALERT_THRESHOLD: ${ALERT_THRESHOLD:-0.8}
+  RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-10}
+  PROMETHEUS_MULTIPROC_DIR: /var/lib/metrics
+
+x-backend-secrets: &backend-secrets
+  - jwt_secret
+  - openrouter_key
+  - grok_key
+
+services:
+  # ------------------------------------------------------------------ proxy
+  traefik:
+    image: traefik:v3.2
+    container_name: gvs-traefik
+    restart: unless-stopped
+    ports:
+      - "80:80"                    # Let's Encrypt HTTP-01 challenge + redirect
+      - "443:443"
+      - "127.0.0.1:8080:8080"      # dashboard (localhost only)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./deploy/traefik:/etc/traefik:ro
+      - acme-data:/etc/traefik/acme
+    environment:
+      - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL:-admin@example.com}
+      - APP_DOMAIN=${APP_DOMAIN:-example.com}
+      - API_DOMAIN=${API_DOMAIN:-api.example.com}
+
+  # ------------------------------------------------------------------- data
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-gemini_vision}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-gemini_vision}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # --------------------------------------------------------------- backend
+  migrate:
+    build: ./backend
+    command: ["alembic", "upgrade", "head"]
+    environment: *backend-env
+    secrets: *backend-secrets
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: ./backend
+    environment: *backend-env
+    secrets: *backend-secrets
+    volumes:
+      - metrics-data:/var/lib/metrics
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=Host(`${API_DOMAIN:-api.example.com}`)"
+      - "traefik.http.routers.api.entrypoints=websecure"
+      - "traefik.http.routers.api.tls=true"
+      - "traefik.http.routers.api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.api.middlewares=security-headers@file"
+      - "traefik.http.services.api.loadbalancer.server.port=8000"
+
+  worker:
+    build: ./backend
+    command: ["/app/scripts/start-worker.sh"]
+    environment: *backend-env
+    secrets: *backend-secrets
+    volumes:
+      - metrics-data:/var/lib/metrics
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  beat:
+    build: ./backend
+    command: ["celery", "-A", "app.core.celery_app", "beat", "-l", "info", "--schedule=/var/lib/celery/celerybeat-schedule"]
+    environment: *backend-env
+    secrets: *backend-secrets
+    volumes:
+      - beat-data:/var/lib/celery
+      - metrics-data:/var/lib/metrics
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ web
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    depends_on:
+      - api
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.web.rule=Host(`${APP_DOMAIN:-example.com}`)"
+      - "traefik.http.routers.web.entrypoints=websecure"
+      - "traefik.http.routers.web.tls=true"
+      - "traefik.http.routers.web.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.web.middlewares=security-headers@file"
+      - "traefik.http.services.web.loadbalancer.server.port=80"
+
+  # ------------------------------------------------- optional LLM in Docker
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["llm"]
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+    # Requires nvidia-container-toolkit on the host. Skip (no --profile llm)
+    # and point OLLAMA_BASE_URL at an external Ollama instance instead.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ------------------------------------------------------------ monitoring
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    restart: unless-stopped
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - api
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GF_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_ADMIN_PASSWORD:?set GF_ADMIN_PASSWORD in .env}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+  # -------------------------------------------------------------- backup
+  backup:
+    build:
+      context: ./deploy/backup
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-gemini_vision}
+      POSTGRES_HOST: postgres
+      MINIO_ALIAS: local
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+      MINIO_BUCKET: artifacts
+      RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+      SCHEDULE: ${BACKUP_SCHEDULE:-"0 3 * * *"}
+    volumes:
+      - ${BACKUP_DIR:-./backups}:/backups:rw
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
+secrets:
+  jwt_secret:
+    file: ./secrets/jwt_secret.txt
+  openrouter_key:
+    file: ./secrets/openrouter_key.txt
+  grok_key:
+    file: ./secrets/grok_key.txt
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  ollama-data:
+  metrics-data:
+  beat-data:
+  acme-data:
+  prometheus-data:
+  grafana-data:

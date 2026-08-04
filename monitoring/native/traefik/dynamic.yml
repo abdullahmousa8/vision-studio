@@ -1,0 +1,33 @@
+# Traefik dynamic config — native Windows.
+# Routes https://localhost -> FastAPI (localhost:8000) with a self-signed cert,
+# and serves the Traefik dashboard on the localhost-only 8090 entrypoint.
+http:
+  routers:
+    web:
+      rule: "Host(`localhost`)"
+      entryPoints:
+        - websecure
+      service: api
+      tls: {}
+
+    dashboard:
+      rule: "PathPrefix(`/`)"
+      entryPoints:
+        - dashboard
+      service: dashboard-api
+
+  services:
+    api:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8000"
+
+    dashboard-api:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8090"
+
+tls:
+  certificates:
+    - certFile: D:/h/gemini-vision-studio/monitoring/native/traefik/certs/localhost.crt
+      keyFile: D:/h/gemini-vision-studio/monitoring/native/traefik/certs/localhost.key
